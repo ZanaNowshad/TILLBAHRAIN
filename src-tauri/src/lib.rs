@@ -15,13 +15,15 @@ struct StartupHealth {
 }
 
 #[tauri::command]
-async fn startup_health_check(database: tauri::State<'_, Database>) -> StartupHealth {
+async fn startup_health_check(
+    database: tauri::State<'_, Database>,
+) -> Result<StartupHealth, String> {
     let ready = database.is_healthy().await;
-    StartupHealth {
+    Ok(StartupHealth {
         ready,
         database: if ready { "ready" } else { "error" },
         app_version: env!("CARGO_PKG_VERSION"),
-    }
+    })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

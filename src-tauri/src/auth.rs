@@ -1,5 +1,12 @@
 use crate::session::SessionStore;
-use sqlx::SqlitePool;
+use argon2::{
+    password_hash::{
+        rand_core::OsRng as PasswordOsRng, PasswordHash, PasswordHasher, PasswordVerifier,
+        SaltString,
+    },
+    Argon2,
+};
+use sqlx::{FromRow, SqlitePool};
 use thiserror::Error;
 
 pub const MAX_FAILED_ATTEMPTS: i64 = 5;
@@ -34,12 +41,35 @@ pub enum Permission {
 }
 
 impl Role {
-    pub fn from_db_name(_name: &str) -> Option<Self> {
-        todo!("RED: role mapping")
+    pub fn from_db_name(name: &str) -> Option<Self> {
+        match name {
+            "owner" => Some(Self::Owner),
+            "manager" => Some(Self::Manager),
+            "cashier" => Some(Self::Cashier),
+            _ => None,
+        }
     }
 
-    pub fn allows(self, _permission: Permission) -> bool {
-        todo!("RED: RBAC")
+    pub fn allows(self, permission: Permission) -> bool {
+        match self {
+            Role::Owner => true,
+            Role::Manager => !matches!(
+                permission,
+                Permission::SecuritySettings
+                    | Permission::DeviceTrust
+                    | Permission::ExternalCredentials
+                    | Permission::Backup
+                    | Permission::StorefrontOwnership
+            ),
+            Role::Cashier => matches!(
+                permission,
+                Permission::PosSell
+                    | Permission::HeldCart
+                    | Permission::CustomerWrite
+                    | Permission::DeliveryOperate
+                    | Permission::ShiftCash
+            ),
+        }
     }
 }
 
@@ -80,42 +110,163 @@ pub enum AuthError {
     Database(#[from] sqlx::Error),
 }
 
-pub fn validate_pin_format(_pin: &str) -> Result<(), AuthError> {
-    todo!("RED: PIN validation")
+#[derive(Debug, FromRow)]
+struct AuthRow {
+    user_id: String,
+    branch_id: String,
+    pin_hash: String,
+    role_name: String,
+    active: i64,
+    failed_attempts: i64,
+    is_locked: i64,
 }
 
-pub fn hash_pin(_pin: &str) -> Result<String, AuthError> {
-    todo!("RED: Argon2id hash")
+#[derive(Debug, FromRow)]
+struct PrincipalRow {
+    user_id: String,
+    branch_id: String,
+    role_name: String,
+    active: i64,
+    is_locked: i64,
 }
 
-pub fn verify_pin(_pin: &str, _encoded_hash: &str) -> Result<bool, AuthError> {
-    todo!("RED: Argon2id verify")
+pub fn validate_pin_format(pin: &str) -> Result<(), AuthError> {
+    if (4..=6).contains(&pin.len()) && pin.bytes().all(|byte| byte.is_ascii_digit()) {
+        Ok(())
+    } else {
+        Err(AuthError::MalformedPin)
+    }
+}
+
+pub fn hash_pin(pin: &str) -> Result<String, AuthError> {
+    validate_pin_format(pin)?;
+    let salt = SaltString::generate(&mut PasswordOsRng);
+    Argon2::default()
+        .hash_password(pin.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|_| AuthError::PinHash)
+}
+
+pub fn verify_pin(pin: &str, encoded_hash: &str) -> Result<bool, AuthError> {
+    validate_pin_format(pin)?;
+    let parsed = PasswordHash::new(encoded_hash).map_err(|_| AuthError::InvalidPinHash)?;
+    Ok(Argon2::default()
+        .verify_password(pin.as_bytes(), &parsed)
+        .is_ok())
 }
 
 pub async fn authenticate(
-    _pool: &SqlitePool,
-    _sessions: &SessionStore,
-    _user_id: &str,
-    _pin: &str,
+    pool: &SqlitePool,
+    sessions: &SessionStore,
+    user_id: &str,
+    pin: &str,
 ) -> Result<LoginSession, AuthError> {
-    todo!("RED: transactional authentication")
+    validate_pin_format(pin)?;
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query_as::<_, AuthRow>(
+        "SELECT u.user_id, u.branch_id, u.pin_hash, r.name AS role_name, u.active, u.failed_attempts, CASE WHEN u.locked_until IS NOT NULL AND datetime(u.locked_until) > CURRENT_TIMESTAMP THEN 1 ELSE 0 END AS is_locked FROM users u JOIN roles r ON r.role_id = u.role_id WHERE u.user_id = ? AND u.deleted_at IS NULL",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(AuthError::InvalidCredentials)?;
+
+    if row.active != 1 {
+        return Err(AuthError::InactiveUser);
+    }
+    if row.is_locked == 1 {
+        return Err(AuthError::LockedOut);
+    }
+
+    let verified = verify_pin(pin, &row.pin_hash)?;
+    if !verified {
+        let next_attempts = row.failed_attempts.saturating_add(1);
+        if next_attempts >= MAX_FAILED_ATTEMPTS {
+            let modifier = format!("+{LOCKOUT_MINUTES} minutes");
+            sqlx::query(
+                "UPDATE users SET failed_attempts = ?, locked_until = datetime('now', ?), updated_at = CURRENT_TIMESTAMP, version = version + 1 WHERE user_id = ?",
+            )
+            .bind(next_attempts)
+            .bind(modifier)
+            .bind(&row.user_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Err(AuthError::LockedOut);
+        }
+
+        sqlx::query(
+            "UPDATE users SET failed_attempts = ?, updated_at = CURRENT_TIMESTAMP, version = version + 1 WHERE user_id = ?",
+        )
+        .bind(next_attempts)
+        .bind(&row.user_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Err(AuthError::InvalidCredentials);
+    }
+
+    let role = Role::from_db_name(&row.role_name).ok_or(AuthError::InvalidRole)?;
+    sqlx::query(
+        "UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, version = version + 1 WHERE user_id = ?",
+    )
+    .bind(&row.user_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    let principal = Principal {
+        user_id: row.user_id,
+        branch_id: row.branch_id,
+        role,
+    };
+    let token = sessions.issue(principal.user_id.clone()).await;
+    Ok(LoginSession { token, principal })
 }
 
 pub async fn resolve_principal(
-    _pool: &SqlitePool,
-    _sessions: &SessionStore,
-    _token: &str,
+    pool: &SqlitePool,
+    sessions: &SessionStore,
+    token: &str,
 ) -> Result<Principal, AuthError> {
-    todo!("RED: session principal resolution")
+    let user_id = sessions
+        .resolve_user_id(token)
+        .await
+        .ok_or(AuthError::InvalidSession)?;
+    let row = sqlx::query_as::<_, PrincipalRow>(
+        "SELECT u.user_id, u.branch_id, r.name AS role_name, u.active, CASE WHEN u.locked_until IS NOT NULL AND datetime(u.locked_until) > CURRENT_TIMESTAMP THEN 1 ELSE 0 END AS is_locked FROM users u JOIN roles r ON r.role_id = u.role_id WHERE u.user_id = ? AND u.deleted_at IS NULL",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or(AuthError::InvalidSession)?;
+
+    if row.active != 1 {
+        return Err(AuthError::InactiveUser);
+    }
+    if row.is_locked == 1 {
+        return Err(AuthError::LockedOut);
+    }
+    let role = Role::from_db_name(&row.role_name).ok_or(AuthError::InvalidRole)?;
+    Ok(Principal {
+        user_id: row.user_id,
+        branch_id: row.branch_id,
+        role,
+    })
 }
 
 pub async fn authorize(
-    _pool: &SqlitePool,
-    _sessions: &SessionStore,
-    _token: &str,
-    _permission: Permission,
+    pool: &SqlitePool,
+    sessions: &SessionStore,
+    token: &str,
+    permission: Permission,
 ) -> Result<Principal, AuthError> {
-    todo!("RED: fail-closed authorization")
+    let principal = resolve_principal(pool, sessions, token).await?;
+    if principal.role.allows(permission) {
+        Ok(principal)
+    } else {
+        Err(AuthError::PermissionDenied)
+    }
 }
 
 #[cfg(test)]

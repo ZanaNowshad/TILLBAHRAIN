@@ -48,6 +48,10 @@ impl SessionStore {
     pub async fn len(&self) -> usize {
         self.sessions.read().await.len()
     }
+
+    pub async fn is_empty(&self) -> bool {
+        self.sessions.read().await.is_empty()
+    }
 }
 
 #[cfg(test)]

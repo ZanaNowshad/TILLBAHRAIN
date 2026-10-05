@@ -60,7 +60,10 @@ mod tests {
         let token = sessions.issue("user-1").await;
         assert_eq!(token.len(), 64);
         assert!(!token.contains("user-1"));
-        assert_eq!(sessions.resolve_user_id(&token).await.as_deref(), Some("user-1"));
+        assert_eq!(
+            sessions.resolve_user_id(&token).await.as_deref(),
+            Some("user-1")
+        );
         assert!(sessions.revoke(&token).await);
         assert_eq!(sessions.resolve_user_id(&token).await, None);
     }

@@ -146,7 +146,7 @@ mod tests {
         )
         .bind(&pin_hash)
         .bind(role)
-        .bind(i64::from(active))
+        .bind(if active { 1_i64 } else { 0_i64 })
         .execute(pool)
         .await
         .unwrap();
@@ -157,9 +157,18 @@ mod tests {
     fn pin_format_is_strict() {
         assert!(validate_pin_format("1234").is_ok());
         assert!(validate_pin_format("123456").is_ok());
-        assert!(matches!(validate_pin_format("123"), Err(AuthError::MalformedPin)));
-        assert!(matches!(validate_pin_format("1234567"), Err(AuthError::MalformedPin)));
-        assert!(matches!(validate_pin_format("12a4"), Err(AuthError::MalformedPin)));
+        assert!(matches!(
+            validate_pin_format("123"),
+            Err(AuthError::MalformedPin)
+        ));
+        assert!(matches!(
+            validate_pin_format("1234567"),
+            Err(AuthError::MalformedPin)
+        ));
+        assert!(matches!(
+            validate_pin_format("12a4"),
+            Err(AuthError::MalformedPin)
+        ));
     }
 
     #[test]
@@ -187,10 +196,17 @@ mod tests {
         seed_user(&pool, "manager", true).await;
         let sessions = SessionStore::default();
 
-        let login = authenticate(&pool, &sessions, "user-1", "4321").await.unwrap();
+        let login = authenticate(&pool, &sessions, "user-1", "4321")
+            .await
+            .unwrap();
         assert_eq!(login.token.len(), 64);
         assert_eq!(login.principal.role, Role::Manager);
-        assert_eq!(resolve_principal(&pool, &sessions, &login.token).await.unwrap(), login.principal);
+        assert_eq!(
+            resolve_principal(&pool, &sessions, &login.token)
+                .await
+                .unwrap(),
+            login.principal
+        );
     }
 
     #[tokio::test]
@@ -203,10 +219,11 @@ mod tests {
             authenticate(&pool, &sessions, "user-1", "1111").await,
             Err(AuthError::InvalidCredentials)
         ));
-        let failed: i64 = sqlx::query_scalar("SELECT failed_attempts FROM users WHERE user_id='user-1'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let failed: i64 =
+            sqlx::query_scalar("SELECT failed_attempts FROM users WHERE user_id='user-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(failed, 1);
         assert_eq!(sessions.len().await, 0);
     }
@@ -257,10 +274,11 @@ mod tests {
             authenticate(&pool, &sessions, "user-1", "12x4").await,
             Err(AuthError::MalformedPin)
         ));
-        let failed: i64 = sqlx::query_scalar("SELECT failed_attempts FROM users WHERE user_id='user-1'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let failed: i64 =
+            sqlx::query_scalar("SELECT failed_attempts FROM users WHERE user_id='user-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(failed, 0);
     }
 
@@ -269,10 +287,14 @@ mod tests {
         let pool = test_pool().await;
         seed_user(&pool, "manager", true).await;
         let sessions = SessionStore::default();
-        let login = authenticate(&pool, &sessions, "user-1", "4321").await.unwrap();
-        assert!(authorize(&pool, &sessions, &login.token, Permission::RefundApprove)
+        let login = authenticate(&pool, &sessions, "user-1", "4321")
             .await
-            .is_ok());
+            .unwrap();
+        assert!(
+            authorize(&pool, &sessions, &login.token, Permission::RefundApprove)
+                .await
+                .is_ok()
+        );
 
         sqlx::query("UPDATE users SET role_id='role_cashier' WHERE user_id='user-1'")
             .execute(&pool)

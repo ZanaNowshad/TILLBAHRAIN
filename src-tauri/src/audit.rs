@@ -1,5 +1,7 @@
-use sqlx::{Sqlite, Transaction};
+use sha2::{Digest, Sha256};
+use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
+use ulid::Ulid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewAuditEvent {
@@ -39,6 +41,51 @@ pub struct AuditRecord {
     pub override_flag: bool,
 }
 
+#[derive(Debug, FromRow)]
+struct DbAuditRecord {
+    audit_id: String,
+    event: String,
+    entity_type: Option<String>,
+    entity_id: Option<String>,
+    actor_id: Option<String>,
+    actor_type: String,
+    ai_action_id: Option<String>,
+    device_id: Option<String>,
+    origin_device_id: Option<String>,
+    branch_id: Option<String>,
+    before_json: Option<String>,
+    after_json: Option<String>,
+    reason: Option<String>,
+    created_at: String,
+    hash: String,
+    previous_hash: Option<String>,
+    override_flag: i64,
+}
+
+impl From<DbAuditRecord> for AuditRecord {
+    fn from(row: DbAuditRecord) -> Self {
+        Self {
+            audit_id: row.audit_id,
+            event: row.event,
+            entity_type: row.entity_type,
+            entity_id: row.entity_id,
+            actor_id: row.actor_id,
+            actor_type: row.actor_type,
+            ai_action_id: row.ai_action_id,
+            device_id: row.device_id,
+            origin_device_id: row.origin_device_id,
+            branch_id: row.branch_id,
+            before_json: row.before_json,
+            after_json: row.after_json,
+            reason: row.reason,
+            created_at: row.created_at,
+            hash: row.hash,
+            previous_hash: row.previous_hash,
+            override_flag: row.override_flag == 1,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum AuditError {
     #[error("audit chain mismatch at index {index}")]
@@ -48,18 +95,119 @@ pub enum AuditError {
 }
 
 pub async fn append_audit(
-    _tx: &mut Transaction<'_, Sqlite>,
-    _event: NewAuditEvent,
+    tx: &mut Transaction<'_, Sqlite>,
+    event: NewAuditEvent,
 ) -> Result<AuditRecord, AuditError> {
-    todo!("RED: append audit record")
+    let previous_hash = sqlx::query_scalar::<_, String>(
+        "SELECT hash FROM audit_logs ORDER BY rowid DESC LIMIT 1",
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    let created_at: String =
+        sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')")
+            .fetch_one(&mut **tx)
+            .await?;
+
+    let mut record = AuditRecord {
+        audit_id: Ulid::new().to_string(),
+        event: event.event,
+        entity_type: event.entity_type,
+        entity_id: event.entity_id,
+        actor_id: event.actor_id,
+        actor_type: event.actor_type,
+        ai_action_id: event.ai_action_id,
+        device_id: event.device_id,
+        origin_device_id: event.origin_device_id,
+        branch_id: event.branch_id,
+        before_json: event.before_json,
+        after_json: event.after_json,
+        reason: event.reason,
+        created_at,
+        hash: String::new(),
+        previous_hash,
+        override_flag: event.override_flag,
+    };
+    record.hash = compute_hash(&record);
+
+    sqlx::query(
+        "INSERT INTO audit_logs (audit_id,event,entity_type,entity_id,actor_id,actor_type,ai_action_id,device_id,origin_device_id,branch_id,before_json,after_json,reason,created_at,hash,previous_hash,override_flag) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    )
+    .bind(&record.audit_id)
+    .bind(&record.event)
+    .bind(&record.entity_type)
+    .bind(&record.entity_id)
+    .bind(&record.actor_id)
+    .bind(&record.actor_type)
+    .bind(&record.ai_action_id)
+    .bind(&record.device_id)
+    .bind(&record.origin_device_id)
+    .bind(&record.branch_id)
+    .bind(&record.before_json)
+    .bind(&record.after_json)
+    .bind(&record.reason)
+    .bind(&record.created_at)
+    .bind(&record.hash)
+    .bind(&record.previous_hash)
+    .bind(if record.override_flag { 1_i64 } else { 0_i64 })
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(record)
 }
 
-pub async fn verify_audit_chain(_pool: &sqlx::SqlitePool) -> Result<(), AuditError> {
-    todo!("RED: verify stored audit chain")
+pub async fn verify_audit_chain(pool: &SqlitePool) -> Result<(), AuditError> {
+    let rows = sqlx::query_as::<_, DbAuditRecord>(
+        "SELECT audit_id,event,entity_type,entity_id,actor_id,actor_type,ai_action_id,device_id,origin_device_id,branch_id,before_json,after_json,reason,created_at,hash,previous_hash,override_flag FROM audit_logs ORDER BY rowid",
+    )
+    .fetch_all(pool)
+    .await?;
+    let records: Vec<AuditRecord> = rows.into_iter().map(Into::into).collect();
+    verify_records(&records)
 }
 
-pub fn verify_records(_records: &[AuditRecord]) -> Result<(), AuditError> {
-    todo!("RED: deterministic chain verification")
+pub fn verify_records(records: &[AuditRecord]) -> Result<(), AuditError> {
+    let mut expected_previous: Option<&str> = None;
+    for (index, record) in records.iter().enumerate() {
+        if record.previous_hash.as_deref() != expected_previous || compute_hash(record) != record.hash {
+            return Err(AuditError::ChainMismatch { index });
+        }
+        expected_previous = Some(record.hash.as_str());
+    }
+    Ok(())
+}
+
+fn compute_hash(record: &AuditRecord) -> String {
+    let mut hasher = Sha256::new();
+    update_optional(&mut hasher, record.previous_hash.as_deref());
+    update_required(&mut hasher, &record.audit_id);
+    update_required(&mut hasher, &record.event);
+    update_optional(&mut hasher, record.entity_type.as_deref());
+    update_optional(&mut hasher, record.entity_id.as_deref());
+    update_optional(&mut hasher, record.actor_id.as_deref());
+    update_required(&mut hasher, &record.actor_type);
+    update_optional(&mut hasher, record.ai_action_id.as_deref());
+    update_optional(&mut hasher, record.device_id.as_deref());
+    update_optional(&mut hasher, record.origin_device_id.as_deref());
+    update_optional(&mut hasher, record.branch_id.as_deref());
+    update_optional(&mut hasher, record.before_json.as_deref());
+    update_optional(&mut hasher, record.after_json.as_deref());
+    update_optional(&mut hasher, record.reason.as_deref());
+    update_required(&mut hasher, &record.created_at);
+    hasher.update([u8::from(record.override_flag)]);
+    hex::encode(hasher.finalize())
+}
+
+fn update_required(hasher: &mut Sha256, value: &str) {
+    hasher.update([1]);
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn update_optional(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => update_required(hasher, value),
+        None => hasher.update([0]),
+    }
 }
 
 #[cfg(test)]
@@ -67,7 +215,7 @@ mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
 
-    async fn test_pool() -> sqlx::SqlitePool {
+    async fn test_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -146,52 +294,5 @@ mod tests {
             verify_records(&records),
             Err(AuditError::ChainMismatch { index: 0 })
         ));
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug, sqlx::FromRow)]
-struct DbAuditRecord {
-    audit_id: String,
-    event: String,
-    entity_type: Option<String>,
-    entity_id: Option<String>,
-    actor_id: Option<String>,
-    actor_type: String,
-    ai_action_id: Option<String>,
-    device_id: Option<String>,
-    origin_device_id: Option<String>,
-    branch_id: Option<String>,
-    before_json: Option<String>,
-    after_json: Option<String>,
-    reason: Option<String>,
-    created_at: String,
-    hash: String,
-    previous_hash: Option<String>,
-    override_flag: i64,
-}
-
-#[cfg(test)]
-impl From<DbAuditRecord> for AuditRecord {
-    fn from(row: DbAuditRecord) -> Self {
-        Self {
-            audit_id: row.audit_id,
-            event: row.event,
-            entity_type: row.entity_type,
-            entity_id: row.entity_id,
-            actor_id: row.actor_id,
-            actor_type: row.actor_type,
-            ai_action_id: row.ai_action_id,
-            device_id: row.device_id,
-            origin_device_id: row.origin_device_id,
-            branch_id: row.branch_id,
-            before_json: row.before_json,
-            after_json: row.after_json,
-            reason: row.reason,
-            created_at: row.created_at,
-            hash: row.hash,
-            previous_hash: row.previous_hash,
-            override_flag: row.override_flag == 1,
-        }
     }
 }

@@ -1,6 +1,8 @@
+pub mod auth;
 pub mod database;
 pub mod money;
 pub mod quantity;
+pub mod session;
 
 use database::Database;
 use serde::Serialize;

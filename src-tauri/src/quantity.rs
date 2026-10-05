@@ -70,7 +70,10 @@ mod tests {
     fn decimal_quantity_is_exact() {
         let one_tenth = Quantity::parse("0.1").unwrap();
         let two_tenths = Quantity::parse("0.2").unwrap();
-        assert_eq!(one_tenth.checked_add(two_tenths).unwrap().to_string(), "0.3");
+        assert_eq!(
+            one_tenth.checked_add(two_tenths).unwrap().to_string(),
+            "0.3"
+        );
     }
 
     #[test]

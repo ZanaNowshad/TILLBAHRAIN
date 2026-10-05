@@ -58,13 +58,19 @@ impl Money {
 
     pub fn checked_add(&self, other: &Self) -> Result<Self, MoneyError> {
         self.ensure_same_unit(other)?;
-        let minor = self.minor.checked_add(other.minor).ok_or(MoneyError::Overflow)?;
+        let minor = self
+            .minor
+            .checked_add(other.minor)
+            .ok_or(MoneyError::Overflow)?;
         Self::new(minor, self.currency.clone(), self.exponent)
     }
 
     pub fn checked_sub(&self, other: &Self) -> Result<Self, MoneyError> {
         self.ensure_same_unit(other)?;
-        let minor = self.minor.checked_sub(other.minor).ok_or(MoneyError::Overflow)?;
+        let minor = self
+            .minor
+            .checked_sub(other.minor)
+            .ok_or(MoneyError::Overflow)?;
         Self::new(minor, self.currency.clone(), self.exponent)
     }
 
@@ -108,7 +114,10 @@ mod tests {
     #[test]
     fn formats_negative_values_without_float_conversion() {
         assert_eq!(Money::bhd(-5).format_amount(), "-0.005");
-        assert_eq!(Money::bhd(i64::MIN).format_amount(), "-9223372036854775.808");
+        assert_eq!(
+            Money::bhd(i64::MIN).format_amount(),
+            "-9223372036854775.808"
+        );
     }
 
     #[test]
